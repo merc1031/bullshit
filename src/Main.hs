@@ -1,8 +1,9 @@
 module Main where
 import Control.Concurrent
-import Control.Concurrent.STM
+import Control.Concurrent.Async
 import Control.Monad
 import Data.List
+import Data.Time.Clock
 import Foreign.Marshal.Alloc
 import GHC.Ptr
 import System.Directory
@@ -14,49 +15,50 @@ import System.Posix.Files
 bufSize :: Int
 bufSize = 464
 
-worker :: TChan FilePath -> TVar Int -> Int -> IO ()
-worker chan count _ = allocaBytes bufSize $ \buf ->
+worker :: Chan FilePath -> Int -> IO ()
+worker chan _ = allocaBytes bufSize $ \buf ->
   forever $ do
-    path <- atomically $ readTChan chan
-    stat <- getFileStatus path
-    when (isDirectory stat) (feedWorker chan path)
-    when (isRegularFile stat) $ do
-      withFile path ReadMode (readContents buf)
-      atomically $ modifyTVar' count (+1)
+    path <- readChan chan
+    contents <- map (path </>) . filter (not . isPrefixOf ".") <$> getDirectoryContents path
+    statted <- zip contents <$> mapConcurrently getFileStatus contents
+    let (dirs, files) = partition (isDirectory . snd) statted
+    writeList2Chan chan $ map fst dirs
+    unless (null files) $ void $ mapConcurrently (readContents buf . fst) files
+    return ()
 
-feedWorker :: TChan FilePath -> String -> IO ()
-feedWorker c path = do
-  contents <- map (path </>) . filter (not . isPrefixOf ".") <$> getDirectoryContents path
-  atomically $ mapM_ (writeTChan c) contents
-  return ()
-
-readContents :: GHC.Ptr.Ptr a -> Handle -> IO ()
-readContents buf h = do
+readContents :: GHC.Ptr.Ptr a -> FilePath -> IO ()
+readContents buf path = withFile path ReadMode $ \h -> do
   hSetBinaryMode h True
   hSetBuffering h $ BlockBuffering $ Just bufSize
   _ <- hGetBuf h buf bufSize
   return ()
 
-timer :: TVar Int -> IO ()
-timer count = do
-  totalV <- newTVarIO 0
-  forever $ do
-    threadDelay 1000000
-    (latest, total) <- atomically $ do
-      x <- readTVar count
-      writeTVar count 0
-      y <- readTVar totalV
-      modifyTVar' totalV (+x)
-      return (x, x+y)
-    putStrLn $ "Loaded " ++ show total ++ ", " ++ show latest ++ "/second"
+mark :: Int
+mark = 1000
+
+timer :: Chan FilePath -> Int -> UTCTime -> IO ()
+timer mon total time = do
+  _ <- readChan mon
+  if total `mod` mark == 0
+    then do
+      newtime <- getCurrentTime
+      let diff = diffUTCTime newtime time
+          rate = truncate $ fromIntegral mark / diff :: Integer
+      putStrLn $ show total ++ " total, " ++ show rate ++ " per second"
+      timer mon (total + 1) newtime
+    else
+      timer mon (total + 1) time
 
 main :: IO ()
 main = do
   args <- getArgs
-  chan <- newTChanIO
-  count <- newTVarIO 0
-  _ <- forkIO $ timer count
+  chan <- newChan
+  monitor <- dupChan chan
+  time <- getCurrentTime
+  _ <- forkIO $ timer monitor 1 time
   case args of
-    [path] -> atomically $ writeTChan chan path
-    _      -> atomically $ writeTChan chan "."
-  mapM_ (worker chan count) [1..10]
+    [path] -> writeChan chan path
+    _      -> writeChan chan "."
+  concurrency <- getNumCapabilities
+  _ <- mapConcurrently (worker chan) [1..concurrency*3]
+  return ()
