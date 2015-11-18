@@ -1,6 +1,9 @@
+{-# LANGUAGE ScopedTypeVariables #-}
 module Main where
 import Control.Concurrent (forkIO)
-import Control.Concurrent.Async
+import Control.Concurrent.Async.Pool
+import Control.Exception
+import qualified Control.Concurrent.Async as A
 import Control.Monad.IO.Class
 import Control.Monad.Trans.Resource
 import Data.Conduit (Sink, Conduit, Source, await, awaitForever, yield)
@@ -22,16 +25,17 @@ bufSize = 464
 readContents :: FilePath -> IO ()
 readContents path = allocaBytes bufSize $ \buf ->
   withFile path ReadMode $ \h -> do
+    putStrLn "WHAT"
     hSetBinaryMode h True
     hSetBuffering h $ BlockBuffering $ Just bufSize
     _ <- hGetBuf h buf bufSize
     return ()
 
-sink :: Sink FilePath IO ()
-sink = awaitForever $ \path -> liftIO $ forkIO $ readContents path
+sink :: TaskGroup -> Sink FilePath IO ()
+sink tg = awaitForever $ \path -> liftIO $ async tg $ readContents path `catch` (\e -> putStrLn $ show (e :: SomeException))
 
 mark :: Int
-mark = 100
+mark = 1000
 
 timer :: Int -> UTCTime -> Conduit FilePath IO FilePath
 timer total time = do
@@ -53,7 +57,7 @@ timer total time = do
 source :: FilePath -> Source IO FilePath
 source path = do
   contents <- liftIO $ map (path </>) . filter (not . isPrefixOf ".") <$> getDirectoryContents path
-  statted <- liftIO $ zip contents <$> mapConcurrently getFileStatus contents
+  statted <- liftIO $ zip contents <$> A.mapConcurrently getFileStatus contents
   let (dirs', files') = partition (isDirectory . snd) statted
       dirs  = map fst dirs'
       files = map fst files'
@@ -64,7 +68,9 @@ crawl :: FilePath -> IO ()
 crawl path = do
   --let source = sourceDirectoryDeep False path
   time <- getCurrentTime
-  source path =$=& timer 1 time $$& sink
+  pool <- createPool
+  tg <- createTaskGroup pool 50
+  source path =$=& timer 1 time $$& (sink tg)
 
 main :: IO ()
 main = do
