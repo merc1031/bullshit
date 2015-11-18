@@ -1,6 +1,7 @@
 {-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE PartialTypeSignatures #-}
 {-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE TupleSections #-}
 module Main where
 import Data.Maybe
 import Control.Concurrent
@@ -29,15 +30,19 @@ bufSize :: Int
 bufSize = 464
 
 workers :: Int
-workers = 80
+workers = 1
 
 allocs :: Int
-allocs = 30
+allocs = 1
 
-worker :: NonBlocking.InChan FilePath -> NonBlocking.Stream FilePath -> (TVar Int, TVar Int) -> Int -> IO ()
-worker wchan rstream (countF,countD) _ = do
+type WorkUnit = (FilePath, FilePath)
+
+worker :: NonBlocking.InChan WorkUnit -> NonBlocking.Stream WorkUnit -> (TVar Int, TVar Int) -> Int -> IO ()
+worker wchan rstream (countF,countD) numAllocs = do
   void $ async $ do
     putStrLn "worker started"
+    buffers <- mapM (\_ -> return $ allocaBytes bufSize) [0..numAllocs]
+    putStrLn "buffs started"
     let act strIn = do
 --        paths <- fmap catMaybes $ mapM (\_ -> do
 --                                       e <- fmap fst $ NonBlocking.tryReadChan rchan
@@ -47,18 +52,20 @@ worker wchan rstream (countF,countD) _ = do
             let readSome !i ps rstr = do
                     h <- NonBlocking.tryReadNext rstr
                     case h of
-                        NonBlocking.Next p rstr' -> case i >= allocs of
+                        NonBlocking.Next p rstr' -> case i >= numAllocs of
                                             False -> readSome (i+1) (p:ps) rstr'
                                             True -> return $ (p:ps, rstr')
                         NonBlocking.Pending -> return (ps,rstr)
             (paths, strOut) <- readSome 0 [] strIn
             (files, dirs) <- foldlM (\(fs, ds) p -> do
-                    stat <- getFileStatus p
+                    let (pa, da) = p
+                        p' = pa </> da
+                    stat <- getFileStatus p'
                     let ds' = if isDirectory stat
-                        then p:ds
+                        then p':ds
                         else ds
                     let fs' = if isRegularFile stat
-                        then p:fs
+                        then p':fs
                         else fs
                     return (fs',ds')
                                     )
@@ -71,10 +78,10 @@ worker wchan rstream (countF,countD) _ = do
 
 
             when ((length files) /= 0) $ do
-                v <- forM (files) $ \path -> do
+                v <- forM (zip buffers files) $ \(buf, path) -> do
                     do
                                                h <- openBinaryFile path ReadMode
-                                               c <- readContents h
+                                               c <- buf $ \b -> readContents h b
                                                hClose h
                                                return (h, c)--return () --withBinaryFile path ReadMode (readContents buf)
 --                mapM (\(h,!c) -> do
@@ -102,20 +109,20 @@ worker wchan rstream (countF,countD) _ = do
 --                    ) roots
 
 
-feedWorker :: NonBlocking.InChan FilePath -> [String] -> IO ()
+feedWorker :: NonBlocking.InChan WorkUnit -> [String] -> IO ()
 feedWorker c paths = do
   contents <- concat <$> mapM (\path -> do
                               l <- getDirectoryContents path
-                              return $ map (path </>) . filter (not . isPrefixOf ".") $ l
+                              return $ map ((path,)) $ filter (not . isPrefixOf ".") $ l
                               ) paths
 --                              fmap ((path </>) . filter (not . isPrefixOf ".")) <$> getDirectoryContents path) paths
   NonBlocking.writeList2Chan c contents
   return ()
 
-readContents :: Handle -> IO _
-readContents h = do
+readContents :: Handle -> Ptr a -> IO _
+readContents h b = do
   hSetBuffering h $ BlockBuffering $ Just bufSize
-  a <- BSL.hGet h bufSize
+  a <- hGetBuf h b bufSize
   return a
 
 timer :: (TVar Int, TVar Int) -> IO ()
@@ -146,12 +153,20 @@ main = do
   countF <- newTVarIO 0
   countD <- newTVarIO 0
   _ <- timer (countF,countD)
-  case args of
-    [path] -> NonBlocking.writeChan wchan path --writer wchan path --atomically $ writeTChan chan path
-    _      -> NonBlocking.writeChan wchan "."  --writer wchan "." --atomically $ writeTChan chan "."
+  (w', a') <- case args of
+    []     -> do
+        NonBlocking.writeChan wchan (".", "")  --writer wchan "." --atomically $ writeTChan chan "." 
+        return (workers, allocs)
+    [path] -> do
+        NonBlocking.writeChan wchan ("", path) --writer wchan path --atomically $ writeTChan chan path
+        return (workers, allocs)
+    [path, w, a] -> do
+        NonBlocking.writeChan wchan ("", path) --writer wchan path --atomically $ writeTChan chan path
+        return (read w, read a)
+
   threadDelay 1000000
-  workerStreams <- NonBlocking.streamChan workers rchan
-  mapM_ (\str -> worker wchan str (countF,countD) 0) workerStreams
+  workerStreams <- NonBlocking.streamChan w' rchan
+  mapM_ (\str -> worker wchan str (countF,countD) a') workerStreams
 
   _ <- getLine
   return ()
