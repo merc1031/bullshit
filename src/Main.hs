@@ -25,9 +25,15 @@ import qualified Control.Concurrent.Chan.Unagi.NoBlocking as NonBlocking
 import System.IO.Unsafe
 import Control.DeepSeq
 import qualified Data.ByteString.Lazy as BSL
+import qualified Data.ByteString as BS
+import System.IO.MMap
+import Data.Int
 
 bufSize :: Int
 bufSize = 464
+
+bufSize64 :: Int64
+bufSize64 = 464
 
 workers :: Int
 workers = 1
@@ -37,11 +43,13 @@ allocs = 1
 
 type WorkUnit = (FilePath, FilePath)
 
-worker :: NonBlocking.InChan WorkUnit -> NonBlocking.Stream WorkUnit -> (TVar Int, TVar Int) -> Int -> IO ()
-worker wchan rstream (countF,countD) numAllocs = do
+bsPutStdErr = BSL.hPut stderr
+
+worker :: NonBlocking.InChan WorkUnit -> NonBlocking.Stream WorkUnit -> UChan.InChan [BSL.ByteString] -> (TVar Int, TVar Int) -> Int -> IO ()
+worker wchan rstream wcollector (countF,countD) numAllocs = do
   void $ async $ do
     putStrLn "worker started"
-    buffers <- mapM (\_ -> return $ allocaBytes bufSize) [0..numAllocs]
+--    buffers <- mapM (\_ -> return $ allocaBytes bufSize) [0..numAllocs]
     putStrLn "buffs started"
     let act strIn = do
             let readSome !i ps rstr = do
@@ -55,9 +63,12 @@ worker wchan rstream (countF,countD) numAllocs = do
 
 
             when ((length paths) /= 0) $ do
-                void $ forM (zip buffers paths) $ \(buf, (root,path)) -> do
+                vs <- forM (paths) $ \((root,path)) -> do
                         let path' = root </> path
-                        withBinaryFile path' ReadMode $ \h -> buf $ \b -> readContents h b
+                        v <- mmapFileByteStringLazy path' (Just (bufSize64, bufSize64))
+                        return v
+                        --withBinaryFile path' ReadMode $ \h -> buf $ \b -> readContents h b
+                UChan.writeChan wcollector vs
                 atomically $ modifyTVar' countF (+ (length paths))
 
             yield
@@ -136,14 +147,22 @@ reader wchan mwchan mrchan countD = do
         act 0
 
 
+collector :: UChan.OutChan [BSL.ByteString] -> IO ()
+collector rcollector = do
+    putStrLn "Start Collector"
+    void $ async $ forever $ do
+        cs <- UChan.readChan rcollector
+        yield
 
 main :: IO ()
 main = do
   args <- getArgs
   (wchan, rchan) <- NonBlocking.newChan
+  (wcollector, rcollector) <- UChan.newChan
   countF <- newTVarIO 0
   countD <- newTVarIO 0
   _ <- timer (countF,countD)
+  _ <- collector rcollector
   (w', a') <- case args of
     []     -> do
         --NonBlocking.writeChan wchan (".", "")  --writer wchan "." --atomically $ writeTChan chan "." 
@@ -160,7 +179,7 @@ main = do
 
   threadDelay 1000000
   workerStreams <- NonBlocking.streamChan w' rchan
-  mapM_ (\str -> worker wchan str (countF,countD) a') workerStreams
+  mapM_ (\str -> worker wchan str wcollector (countF,countD) a') workerStreams
 
   _ <- getLine
   return ()
