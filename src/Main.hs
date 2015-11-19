@@ -31,186 +31,110 @@ import qualified Data.ByteString as BS
 import System.IO.MMap
 import Data.Int
 import Data.Word8
+import qualified Control.Concurrent.STM.SSem as SSem
+import qualified Data.Time.Clock.POSIX as POSIX
+--import qualified TH as CH
 
 bufSize :: Int
 bufSize = 464
 
-bufSize64 :: Int64
-bufSize64 = 464
+numWorkers :: Int
+numWorkers = 1
 
-workers :: Int
-workers = 1
+newtype AbsFilePath = AbsFilePath { unAbsFilePath :: FilePath } deriving Show
+type WorkUnit = (FileStatus, FilePath, AbsFilePath)
 
-allocs :: Int
-allocs = 1
+l `addF` r = FileCount $ unFileCount l + unFileCount r
+l `addD` r = DirCount $ unDirCount l + unDirCount r
 
-type WorkUnit = (FilePath, FilePath)
+worker :: UChan.InChan WorkUnit -> UChan.OutChan WorkUnit -> TVar Int -> Count -> IO ()
+worker wchan rchan work (countF,countD) = do
+    void $ forkIO $ do
+        buffer <- return $ allocaBytes bufSize
+        forever $ do
+            (fs, r, a) <- UChan.readChan rchan
+            when (not $ isPrefixOf "." r) $ do
+                if isDirectory fs
+                   then do
+                       let addWork w = do
+                            let aw = unAbsFilePath a </> w
+                            atomically $ modifyTVar' work (+1)
+                            wfs <- getFileStatus aw
+                            UChan.writeChan wchan (wfs, w, AbsFilePath aw)
 
-bsPutStdErr = BS.hPut stderr
+                       contents <- getDirectoryContents $ unAbsFilePath a
+                       mapM_ addWork contents
+                       atomically $ modifyTVar' countD (`addD` DirCount 1)
+                   else do
+--                       withBinaryFile (unAbsFilePath a) ReadMode $ \h -> buffer $ \b -> do
+--                            hSetBuffering h $ BlockBuffering $ Just bufSize
+--                            void $ hGetBufNonBlocking h b bufSize
+                       void $ fmap (BSL.take (fromIntegral bufSize)) $ BSL.readFile $ unAbsFilePath a
+                       atomically $ modifyTVar' countF (`addF` FileCount 1)
+            atomically $ modifyTVar' work (\x -> x - 1)
 
-worker :: NonBlocking.InChan [WorkUnit] -> NonBlocking.Stream [WorkUnit] -> UChan.InChan [Handle] -> MVar Bool -> (TVar Int, TVar Int) -> Int -> IO ()
-worker wchan rstream wcollector start (countF,countD) numAllocs = do
-  void $ async $ do
-    buffers <- mapM (\_ -> return $ allocaBytes bufSize) [0..numAllocs]
-    let act strIn = do
-            let readSome !i ps rstr = do
-                    h <- NonBlocking.tryReadNext rstr
-                    case h of
-                        NonBlocking.Next p rstr' -> case i >= numAllocs of
-                                            False -> readSome (i+1) (p:ps) rstr'
-                                            True -> return $ (p:ps, rstr')
-                        NonBlocking.Pending -> return (ps,rstr)
-            (paths', strOut) <- readSome 1 [[]] strIn
-            let paths = concat paths'
+newtype FileCount = FileCount { unFileCount :: Int }
+newtype DirCount = DirCount { unDirCount :: Int }
 
+type Count = (TVar FileCount, TVar DirCount)
 
-            when ((length paths) /= 0) $ do
---                vs <- forM (paths) $ \((root,path)) -> do
---                        let path' = root </> path
---                        !v <- mmapFileByteString path' (Just (0, bufSize))
---                        evaluate v
---                        --withBinaryFile path' ReadMode $ \h -> buf $ \b -> readContents h b
-                vs <- forM (zip buffers paths) $ \(buf, (root,path)) -> do
-                        let path' = root </> path
---                        !v <- withBinaryFile path' ReadMode $ \h -> buf $ \b -> do
-                        v <- buf $ \b -> do
-                            h <- openBinaryFile path' ReadMode
-                            readContents h b
-                            !a <- peekArray bufSize b
-                            return h
-                        return v
-                UChan.writeChan wcollector vs
-                atomically $ modifyTVar' countF (+ (length paths))
-                void $ tryPutMVar start True
-
-            yield
-            act strOut
-    act rstream `catch` (\(e :: SomeException) -> putStrLn $ show e)
-
-
-readContents :: Handle -> Ptr Word8 -> IO _
-readContents h b = do
-  hSetBuffering h $ BlockBuffering $ Just bufSize
-  a <- hGetBufNonBlocking h b bufSize
-  return a
-
-timer :: (TVar Int, TVar Int) -> IO ()
+timer :: Count -> IO ()
 timer (countF, countD) = do
   putStrLn "Starting TImer"
-  totalF <- newTVarIO 0
-  totalD <- newTVarIO 0
+  totalF <- newTVarIO $ FileCount 0
+  totalD <- newTVarIO $ DirCount 0
   void $ async $ forever $ do
+    s <- POSIX.getPOSIXTime
     threadDelay 1000000
-    (latest, total, latestD, total') <- atomically $ do
-      x <- readTVar countF
-      z <- readTVar countD
-      writeTVar countF 0
-      writeTVar countD 0
-      y <- readTVar totalF
-      w <- readTVar totalD
-      modifyTVar' totalF (+x)
-      modifyTVar' totalD (+z)
-      return (x, x+y, z, z+w)
-    putStrLn $ "Loaded Files (" ++ show total ++ ", " ++ show latest ++ "/second) Directories (" ++ show total' ++ ", " ++ show latestD ++ "/second)"
-
-type ReaderData = FilePath
-
-readers :: NonBlocking.InChan [WorkUnit] -> TVar Int -> FilePath -> IO ()
-readers wchan countD path = do
-    roots <- Find.find (depth <=? 0) (depth >=? 1 &&? fileType ==? Directory &&? filePath /=? path) path
-    (mwchan, mrchan) <- UChan.newChan
-    UChan.writeList2Chan mwchan roots
-    mapM_ (\_ -> reader wchan mwchan mrchan countD) roots
-
-reader :: NonBlocking.InChan [WorkUnit] -> UChan.InChan ReaderData -> UChan.OutChan ReaderData -> TVar Int -> IO ()
-reader wchan mwchan mrchan countD = do
-    void $ async $ do
-        let act !iter = do
-                command <- UChan.tryReadChan mrchan
-                res <- UChan.tryRead $ fst command
-                case res of
-                    Just path -> do
-                            contents <- filter (not . isPrefixOf ".") <$> getDirectoryContents path
-                            (files, dirs) <- foldlM (\(fs, ds) p -> do
-                                    let p' = path </> p
-                                    stat <- getFileStatus p'
-                                    let ds' = if isDirectory stat
-                                        then p':ds
-                                        else ds
-                                    let fs' = if isRegularFile stat
-                                        then (path,p):fs
-                                        else fs
-                                    return (fs',ds')
-                                                    )
-                                                    ([], [])
-                                                    contents
-                            atomically $ modifyTVar' countD (+ (length dirs))
-                            NonBlocking.writeChan wchan files
-                            UChan.writeList2Chan mwchan dirs
-                            yield
-                            act iter
-                    Nothing -> do
-                        if iter > 10
-                        then do
-                            yield
-                        else do threadDelay 1000000
-                                act (iter + 1)
-        act 0
-
-
-collector :: UChan.OutChan [Handle] -> MVar Bool -> MVar Bool -> IO ()
-collector rcollector start done = do
-    putStrLn "Start Collector"
-    void $ async $ do
-        let act !iter !cs' = do
-                _ <- readMVar start
-                cse <- UChan.tryReadChan rcollector
-                cse' <- UChan.tryRead $ fst cse
-                case cse' of
-                  Just cs -> do
-                    yield
-                    act 0 (cs:cs')
-                  Nothing -> do
-                    if iter > 20
-                       then do
-                           putStrLn "Collector in final phase"
---                           bsPutStdErr $ BSL.concat $ concat cs'
-                           mapM_ hClose $ concat cs'
-                           putStrLn "Collector done"
-                           putMVar done True
-                       else do
-                           threadDelay 1000000
-                           act (iter + 1) cs'
-        act 0 [[]]
+    (curFiles, totalFiles, curDirs, totalDirs) <- atomically $ do
+      fc <- readTVar countF
+      dc <- readTVar countD
+      writeTVar countF $ FileCount 0
+      writeTVar countD $ DirCount 0
+      tfc <- readTVar totalF
+      tdc <- readTVar totalD
+      modifyTVar' totalF (`addF` fc)
+      modifyTVar' totalD (`addD` dc)
+      return (fc, fc `addF` tfc, dc, dc `addD` tdc)
+    e <- POSIX.getPOSIXTime
+    let diff = fromIntegral $ floor $ e - s
+    putStrLn $ "Loaded Files ("
+            ++ show (unFileCount totalFiles)
+            ++ ", "
+            ++ show ((fromIntegral $ unFileCount curFiles) / diff)
+            ++ "/second) Directories ("
+            ++ show (unDirCount totalDirs)
+            ++ ", "
+            ++ show ((fromIntegral $ unDirCount curDirs) / diff)
+            ++ "/second)"
 
 main :: IO ()
 main = do
   args <- getArgs
-  (wchan, rchan) <- NonBlocking.newChan
-  (wcollector, rcollector) <- UChan.newChan
-  start <- newEmptyMVar
-  done <- newEmptyMVar
-  countF <- newTVarIO 0
-  countD <- newTVarIO 0
+  (wchan, rchan) <- UChan.newChan
+  work <- newTVarIO 0
+  countF <- newTVarIO $ FileCount 0
+  countD <- newTVarIO $ DirCount 0
   _ <- timer (countF,countD)
-  _ <- collector rcollector start done
-  (w', a') <- case args of
-    []     -> do
-        --NonBlocking.writeChan wchan (".", "")  --writer wchan "." --atomically $ writeTChan chan "." 
-        readers wchan countD "."
-        return (workers, allocs)
+  let mkWork f = do
+        fs <- getFileStatus f
+        return $ (fs, "", AbsFilePath f)
+  configNumWorkers <- case args of
     [path] -> do
-        --NonBlocking.writeChan wchan ("", path) --writer wchan path --atomically $ writeTChan chan path
-        readers wchan countD path
-        return (workers, allocs)
-    [path, w, a] -> do
-        --NonBlocking.writeChan wchan ("", path) --writer wchan path --atomically $ writeTChan chan path
-        readers wchan countD path
-        return (read w, read a)
+        w <- mkWork path
+        atomically $ modifyTVar' work (+1)
+        UChan.writeChan wchan w
+        return (numWorkers)
+    [path, nw] -> do
+        w <- mkWork path
+        atomically $ modifyTVar' work (+1)
+        UChan.writeChan wchan w
+        return $ read nw
 
-  threadDelay 1000000
-  workerStreams <- NonBlocking.streamChan w' rchan
-  mapM_ (\str -> worker wchan str wcollector start (countF,countD) a') workerStreams
+  mapM_ (\_ -> worker wchan rchan work (countF,countD)) [1..configNumWorkers]
 
-  _ <- takeMVar done
+  atomically $ do
+      val <- readTVar work
+      when (val /= 0) $
+         retry
   return ()
