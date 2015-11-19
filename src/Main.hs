@@ -36,6 +36,7 @@ import qualified Data.Time.Clock.POSIX as POSIX
 import Data.IORef
 import Foreign.C
 import Foreign.C.String
+import Foreign.Marshal.Array
 --import qualified TH as CH
 
 bufSize :: Int
@@ -44,40 +45,61 @@ bufSize = 464
 numWorkers :: Int
 numWorkers = 1
 
+numAllocs :: Int
+numAllocs = 1
+
 newtype AbsFilePath = AbsFilePath { unAbsFilePath :: FilePath } deriving Show
 type WorkUnit = (FileStatus, FilePath, AbsFilePath)
 
 l `addF` r = FileCount $ unFileCount l + unFileCount r
 l `addD` r = DirCount $ unDirCount l + unDirCount r
 
-worker :: UChan.InChan WorkUnit -> UChan.OutChan WorkUnit -> TVar Int -> Count -> IO ()
-worker wchan rchan work (countF,countD) = do
+worker :: UChan.InChan WorkUnit -> UChan.OutChan WorkUnit -> IORef Int -> Count -> Int -> IO ()
+worker wchan rchan work (countF,countD) configNumAllocs = do
     void $ forkIO $ do
---        buffer <- return $ allocaBytes bufSize
-        forever $ do
-            (fs, r, a) <- UChan.readChan rchan
-            when (not $ isPrefixOf "." r) $ do
-                if isDirectory fs
-                   then do
-                       let addWork w = do
-                            let aw = unAbsFilePath a </> w
-                            atomically $ modifyTVar' work (+1)
-                            wfs <- getFileStatus aw
-                            UChan.writeChan wchan (wfs, w, AbsFilePath aw)
+--        buffers <- mapM (\_ -> return $ allocaBytes bufSize) [1..configNumAllocs]
+        buffers <- mapM (\_ -> mallocBytes bufSize) [1..configNumAllocs]
+        forever $ (do
+            firstWork <- UChan.readChan rchan
+            let getMore acc !i = do
+                    if i == configNumAllocs
+                       then return acc
+                       else do
+                            f <- UChan.tryReadChan rchan
+                            e <- UChan.tryRead $ fst f
+                            case e of
+                                Just e' -> getMore (e':acc) (i+1)
+                                Nothing -> return acc
+            allWorks <- getMore [firstWork] 1
 
-                       contents <- getDirectoryContents $ unAbsFilePath a
-                       mapM_ addWork contents
---                       atomically $ modifyTVar' countD (`addD` DirCount 1)
-                       atomicModifyIORef' countD (\v -> (v `addD` DirCount 1, ()))
-                   else do
---                       withBinaryFile (unAbsFilePath a) ReadMode $ \h -> buffer $ \b -> do
---                            hSetBuffering h $ BlockBuffering $ Just bufSize
---                            void $ hGetBufNonBlocking h b bufSize
---                       void $ fmap (BSL.take (fromIntegral bufSize)) $ BSL.readFile $ unAbsFilePath a
-                       withCString (unAbsFilePath a) $ \c -> c_hs_read_bytes bufSize c
---                       atomically $ modifyTVar' countF (`addF` FileCount 1)
-                       atomicModifyIORef' countF (\v -> (v `addF` FileCount 1, ()))
-            atomically $ modifyTVar' work (\x -> x - 1)
+            let filteredWorks = filter (\(_, r', _) -> not $ isPrefixOf "." r') allWorks
+                (dirs, files) = partition (\(fs', _, _) -> isDirectory fs') filteredWorks
+
+            contents <- forM dirs $ \(_,_,a') -> do
+                l <- getDirectoryContents $ unAbsFilePath a'
+                return (a', l)
+
+            let toWork :: (AbsFilePath, [FilePath]) -> IO [WorkUnit]
+                toWork (a', w') = do
+                    forM w' $ \w'' -> do
+                            let aw = unAbsFilePath a' </> w''
+                            fs' <- getFileStatus aw
+                            return (fs', w'', AbsFilePath $ aw)
+
+            realContent <- mapM toWork contents
+            let flatRealContent = concat realContent
+            atomicModifyIORef' work $ (\v -> (v + length flatRealContent, ()))
+            UChan.writeList2Chan wchan flatRealContent
+            atomicModifyIORef' countD (\v -> (v `addD` (DirCount $ length dirs), ()))
+
+
+            let bufferWorks = zip buffers files
+--            mapM_ (\(buffer, (_,_,a')) -> buffer $ \b -> withCString (unAbsFilePath a') $ \fp -> c_hs_read_bytes bufSize fp b) bufferWorks
+            strs <- mapM (\(_, (_,_,a')) -> newCString $ unAbsFilePath a') bufferWorks
+            withArray strs $ \strs' -> withArray buffers $ \buffers' -> c_hs_read_many_bytes bufSize (length strs) strs' buffers'
+            atomicModifyIORef' countF (\v -> (v `addF` (FileCount $ length bufferWorks), ()))
+            atomicModifyIORef' work $ (\v -> (v - length allWorks, ()))
+            ) `catch` (\e -> putStrLn $ show (e :: SomeException))
 
 newtype FileCount = FileCount { unFileCount :: Int }
 newtype DirCount = DirCount { unDirCount :: Int }
@@ -92,16 +114,6 @@ timer (countF, countD) = do
   void $ async $ forever $ do
     s <- POSIX.getPOSIXTime
     threadDelay 1000000
---    (curFiles, totalFiles, curDirs, totalDirs) <- atomically $ do
---      fc <- readTVar countF
---      dc <- readTVar countD
---      writeTVar countF $ FileCount 0
---      writeTVar countD $ DirCount 0
---      tfc <- readTVar totalF
---      tdc <- readTVar totalD
---      modifyTVar' totalF (`addF` fc)
---      modifyTVar' totalD (`addD` dc)
---      return (fc, fc `addF` tfc, dc, dc `addD` tdc)
     fc <- atomicModifyIORef' countF $ \v -> (FileCount 0, v)
     dc <- atomicModifyIORef' countD $ \v -> (DirCount 0, v)
 
@@ -128,32 +140,42 @@ main :: IO ()
 main = do
   args <- getArgs
   (wchan, rchan) <- UChan.newChan
-  work <- newTVarIO 0
+  work <- newIORef 0
   countF <- newIORef $ FileCount 0
   countD <- newIORef $ DirCount 0
   _ <- timer (countF,countD)
   let mkWork f = do
         fs <- getFileStatus f
         return $ (fs, "", AbsFilePath f)
-  configNumWorkers <- case args of
+  (configNumWorkers, configNumAllocs) <- case args of
     [path] -> do
         w <- mkWork path
-        atomically $ modifyTVar' work (+1)
+        atomicModifyIORef' work (\v -> (v + 1, ()))
         UChan.writeChan wchan w
-        return (numWorkers)
+        return (numWorkers, numAllocs)
     [path, nw] -> do
         w <- mkWork path
-        atomically $ modifyTVar' work (+1)
+        atomicModifyIORef' work (\v -> (v + 1, ()))
         UChan.writeChan wchan w
-        return $ read nw
+        return $ (read nw, numAllocs)
+    [path, nw, na] -> do
+        w <- mkWork path
+        atomicModifyIORef' work (\v -> (v + 1, ()))
+        UChan.writeChan wchan w
+        return $ (read nw, read na)
 
-  mapM_ (\_ -> worker wchan rchan work (countF,countD)) [1..configNumWorkers]
+  mapM_ (\_ -> worker wchan rchan work (countF,countD) configNumAllocs) [1..configNumWorkers]
 
-  atomically $ do
-      val <- readTVar work
-      when (val /= 0) $
-         retry
+  forever $ do
+        val <- atomicModifyIORef' work (\v -> (v,v))
+        when (val == 0) $
+         fail "BooM"
+        putStrLn ("Outstanding" ++ show val)
+        threadDelay 1000000
   return ()
 
 foreign import ccall "hs_read_bytes"
-    c_hs_read_bytes :: Int -> CString -> IO Int
+    c_hs_read_bytes :: Int -> CString -> Ptr CChar -> IO Int
+    
+foreign import ccall "hs_read_many_bytes"
+    c_hs_read_many_bytes :: Int -> Int -> Ptr CString -> Ptr (Ptr CChar) -> IO Int

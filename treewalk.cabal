@@ -23,5 +23,5 @@ executable treewalk
 
   c-sources : cbits/wrapper.c
 --  c-sources: src/TH.c
---  cc-options: -Wall -O2
+  cc-options: -O2 -std=c99
 

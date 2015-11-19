@@ -2,15 +2,26 @@
 #include <HsFFI.h>
 
 HsInt
-hs_read_bytes(const HsInt i, char* fp) {
+hs_read_bytes(const HsInt buf, char* fp, char* buffer) {
     FILE* pFile;
-    char* buffer;
-    long bufSize = (long)i;
-    pFile = fopen(fp, "r");
-    buffer = (char*) malloc (sizeof(char)*i);
-    fread(buffer,1,i,pFile);
+    long bufSize = (long)buf;
+    pFile = fopen(fp, "rb");
+    fread(buffer,1,bufSize,pFile);
     fclose(pFile);
-    free (buffer);
+    return 0;
+}
+
+HsInt
+hs_read_many_bytes(const HsInt buf, const HsInt ct, char** fps, char** buffers) {
+    FILE* pFile;
+    long bufSize = (long)buf;
+    for (int i = 0; i < ct; ++i) {
+        char* fp = fps[i];
+        char* buffer = buffers[i];
+        pFile = fopen(fp, "rb");
+        fread(buffer,1,bufSize,pFile);
+        fclose(pFile);
+    }
     return 0;
 }
 
