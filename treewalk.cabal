@@ -21,6 +21,7 @@ executable treewalk
   ld-options:          -pthread -static
   ghc-options:         -threaded -rtsopts -O2 -with-rtsopts=-N
 
+  c-sources : cbits/wrapper.c
 --  c-sources: src/TH.c
 --  cc-options: -Wall -O2
 
