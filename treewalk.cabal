@@ -16,6 +16,6 @@ executable treewalk
   hs-source-dirs:      src
   main-is:             Main.hs
   default-language:    Haskell2010
-  build-depends:       base >= 4.7 && < 5, unix, directory, filepath, stm, async, filemanip, unagi-chan, deepseq, bytestring, mmap
+  build-depends:       base >= 4.7 && < 5, unix, directory, filepath, stm, async, filemanip, unagi-chan, deepseq, bytestring, mmap, word8
   ld-options:          -pthread -static
   ghc-options:         -O2 -threaded -rtsopts -with-rtsopts=-N

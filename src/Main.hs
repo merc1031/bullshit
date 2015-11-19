@@ -5,6 +5,7 @@
 module Main where
 import Data.Maybe
 import Control.Concurrent
+import Control.Concurrent.MVar
 import Control.Concurrent.STM
 import Control.Concurrent.Async
 import Control.Monad
@@ -12,6 +13,7 @@ import Control.Exception
 import Data.Foldable
 import Data.List
 import Foreign.Marshal.Alloc
+import Foreign.Marshal.Array
 import GHC.Ptr
 import System.Directory
 import System.Environment (getArgs)
@@ -28,6 +30,7 @@ import qualified Data.ByteString.Lazy as BSL
 import qualified Data.ByteString as BS
 import System.IO.MMap
 import Data.Int
+import Data.Word8
 
 bufSize :: Int
 bufSize = 464
@@ -43,13 +46,13 @@ allocs = 1
 
 type WorkUnit = (FilePath, FilePath)
 
-bsPutStdErr = BSL.hPut stderr
+bsPutStdErr = BS.hPut stderr
 
-worker :: NonBlocking.InChan WorkUnit -> NonBlocking.Stream WorkUnit -> UChan.InChan [BSL.ByteString] -> (TVar Int, TVar Int) -> Int -> IO ()
-worker wchan rstream wcollector (countF,countD) numAllocs = do
+worker :: NonBlocking.InChan WorkUnit -> NonBlocking.Stream WorkUnit -> UChan.InChan [BS.ByteString] -> MVar Bool -> (TVar Int, TVar Int) -> Int -> IO ()
+worker wchan rstream wcollector start (countF,countD) numAllocs = do
   void $ async $ do
     putStrLn "worker started"
---    buffers <- mapM (\_ -> return $ allocaBytes bufSize) [0..numAllocs]
+    buffers <- mapM (\_ -> return $ allocaBytes bufSize) [0..numAllocs]
     putStrLn "buffs started"
     let act strIn = do
             let readSome !i ps rstr = do
@@ -63,11 +66,19 @@ worker wchan rstream wcollector (countF,countD) numAllocs = do
 
 
             when ((length paths) /= 0) $ do
-                vs <- forM (paths) $ \((root,path)) -> do
+                tryPutMVar start True
+--                vs <- forM (paths) $ \((root,path)) -> do
+--                        let path' = root </> path
+--                        !v <- mmapFileByteString path' (Just (0, bufSize))
+--                        evaluate v
+--                        --withBinaryFile path' ReadMode $ \h -> buf $ \b -> readContents h b
+                vs <- forM (zip buffers paths) $ \(buf, (root,path)) -> do
                         let path' = root </> path
-                        v <- mmapFileByteStringLazy path' (Just (bufSize64, bufSize64))
-                        return v
-                        --withBinaryFile path' ReadMode $ \h -> buf $ \b -> readContents h b
+                        !v <- withBinaryFile path' ReadMode $ \h -> buf $ \b -> do
+                            readContents h b
+                            a <- peekArray bufSize b
+                            return $ BS.pack a
+                        evaluate v
                 UChan.writeChan wcollector vs
                 atomically $ modifyTVar' countF (+ (length paths))
 
@@ -76,7 +87,7 @@ worker wchan rstream wcollector (countF,countD) numAllocs = do
     act rstream `catch` (\(e :: SomeException) -> putStrLn $ show e)
 
 
-readContents :: Handle -> Ptr BSL.ByteString -> IO _
+readContents :: Handle -> Ptr Word8 -> IO _
 readContents h b = do
   hSetBuffering h $ BlockBuffering $ Just bufSize
   a <- hGetBufNonBlocking h b bufSize
@@ -141,28 +152,49 @@ reader wchan mwchan mrchan countD = do
                             act iter
                     Nothing -> do
                         if iter > 10
-                        then yield
+                        then do
+                            putStrLn "Done"
+                            yield
                         else do threadDelay 1000000
                                 act (iter + 1)
         act 0
 
 
-collector :: UChan.OutChan [BSL.ByteString] -> IO ()
-collector rcollector = do
+collector :: UChan.OutChan [BS.ByteString] -> MVar Bool -> MVar Bool -> IO ()
+collector rcollector start done = do
     putStrLn "Start Collector"
-    void $ async $ forever $ do
-        cs <- UChan.readChan rcollector
-        yield
+    void $ async $ do
+        let act !iter !cs' = do
+                _ <- readMVar start
+                cse <- UChan.tryReadChan rcollector
+                cse' <- UChan.tryRead $ fst cse
+                case cse' of
+                  Just cs -> do
+                    yield
+                    act iter (cs:cs')
+                  Nothing -> do
+                    if iter > 10
+                       then do
+                           putStrLn "Collector in final phase"
+--                           bsPutStdErr $ BSL.concat $ concat cs'
+                           putStrLn "Collector done"
+                           putMVar done True
+                       else do
+                           threadDelay 1000000
+                           act (iter + 1) cs'
+        act 0 [[]]
 
 main :: IO ()
 main = do
   args <- getArgs
   (wchan, rchan) <- NonBlocking.newChan
   (wcollector, rcollector) <- UChan.newChan
+  start <- newEmptyMVar
+  done <- newEmptyMVar
   countF <- newTVarIO 0
   countD <- newTVarIO 0
   _ <- timer (countF,countD)
-  _ <- collector rcollector
+  _ <- collector rcollector start done
   (w', a') <- case args of
     []     -> do
         --NonBlocking.writeChan wchan (".", "")  --writer wchan "." --atomically $ writeTChan chan "." 
@@ -179,7 +211,7 @@ main = do
 
   threadDelay 1000000
   workerStreams <- NonBlocking.streamChan w' rchan
-  mapM_ (\str -> worker wchan str wcollector (countF,countD) a') workerStreams
+  mapM_ (\str -> worker wchan str wcollector start (countF,countD) a') workerStreams
 
-  _ <- getLine
+  _ <- takeMVar done
   return ()
