@@ -92,7 +92,7 @@ bufSize = 464
 
 
 newtype AbsFilePath = AbsFilePath { unAbsFilePath :: FilePath } deriving Show
-type WorkUnit = (FileStatus, FilePath, AbsFilePath)
+type WorkUnit = (FilePath, AbsFilePath)
 
 l `addF` r = FileCount $ unFileCount l + unFileCount r
 l `addD` r = DirCount $ unDirCount l + unDirCount r
@@ -102,42 +102,46 @@ worker wchan rchan work counters = do
     void $ forkIO $ do
         buffer <- mallocBytes bufSize
         forever $ do
-            (fs, r, a) <- UChan.readChan rchan
-            when (not $ isPrefixOf "." r) $ do
-                if isDirectory fs
-                   then do
-                       let addWork w = do
-                            let aw = unAbsFilePath a </> w
+            (r, a) <- UChan.readChan rchan
+            let absPath = unAbsFilePath a
+--            when (not $ isPrefixOf "." r) $ do
+--                if isDirectory fs
+            if r /= "10s"
+                then do
+                    let addWork w = do
+                            let aw = absPath </> w
                             atomically $ modifyTVar' work (+1)
-                            wfs <- getFileStatus aw
-                            UChan.writeChan wchan (wfs, w, AbsFilePath aw)
+    --                            wfs <- getFileStatus aw
+                            UChan.writeChan wchan (w, AbsFilePath aw)
 
-                       contents <- getDirectoryContents $ unAbsFilePath a
-                       let purgeContents c = do
-                                if c == "1h" || c == "5m"
-                                   then do
-                                       fs <- getFileStatus c
-                                       return $ if isRegularFile fs
-                                            then False
-                                            else True
-                                   else return True
-                       filtered <- filterM (\x -> do
-                                    p <- purgeContents x
-                                    let p' = (not $ isPrefixOf "." x)
-                                    return $ p || p') contents
-
-                       mapM_ addWork filtered
-                       void $ forM counters $ \(_,countD) ->
-                            atomicModifyIORef' countD (\v -> (v `addD` DirCount 1, ()))
-                   else do
-                       --withCString (unAbsFilePath a) $ \c -> c_hs_read_bytes bufSize c buffer
-                       let absPath = unAbsFilePath a
-                           paths = [absPath, replace "10s" "5m" absPath, replace "10s" "1h" absPath]
-                       strs <- mapM newCString paths
-                       withArray strs $ \ps -> c_hs_read_bytes bufSize (length paths) ps buffer
-                       mapM free strs
-                       void $ forM counters $ \(countF,_) ->
-                            atomicModifyIORef' countF (\v -> (v `addF` FileCount 1, ()))
+                    contents <- getDirectoryContents $ absPath
+--                    let purgeContents c = do
+--                            if c == "1h" || c == "5m"
+--                                then do
+--                                    fs <- getFileStatus $ absPath </> c
+--                                    return $ if isRegularFile fs
+--                                        then False
+--                                        else True
+--                                else return True
+--                    filtered <- filter (not . isPrefixOf "." || (==)"1h" || (==)"5m") <$> filterM (\x -> do
+--                                p <- purgeContents x
+--                                return $ p) contents
+                    let pfx = not . isPrefixOf "."
+                        ctrh = (/=) "1h"
+                        ctrm = (/=) "5m"
+                        conditions x = all ($ x) [pfx, ctrh, ctrm]
+                        filtered = filter (conditions) contents
+                    mapM_ addWork filtered
+                    void $ forM counters $ \(_,countD) ->
+                        atomicModifyIORef' countD (\v -> (v `addD` DirCount 1, ()))
+                else do
+                    --withCString (unAbsFilePath a) $ \c -> c_hs_read_bytes bufSize c buffer
+                    let paths = [absPath, replace "10s" "5m" absPath, replace "10s" "1h" absPath]
+                    strs <- mapM newCString paths
+                    withArray strs $ \ps -> c_hs_read_bytes bufSize (length paths) ps buffer
+                    mapM free strs
+                    void $ forM counters $ \(countF,_) ->
+                        atomicModifyIORef' countF (\v -> (v `addF` FileCount 1, ()))
             atomically $ modifyTVar' work (\x -> x - 1)
 
 newtype FileCount = FileCount { unFileCount :: Int }
@@ -185,8 +189,7 @@ main = do
   when (count args) $
     timer (countF,countD)
   let mkWork f = do
-        fs <- getFileStatus f
-        return $ (fs, "", AbsFilePath f)
+        return $ ("", AbsFilePath f)
 
   w <- mkWork (dir args)
   atomically $ modifyTVar' work (+1)
