@@ -54,6 +54,7 @@ import Options.Applicative     ( Parser
                                , auto
                                )
 import Data.Monoid ((<>))
+import Data.String.Utils
 
 data CliArguments = CliArguments
     { dir :: !FilePath
@@ -112,11 +113,29 @@ worker wchan rchan work counters = do
                             UChan.writeChan wchan (wfs, w, AbsFilePath aw)
 
                        contents <- getDirectoryContents $ unAbsFilePath a
-                       mapM_ addWork contents
+                       let purgeContents c = do
+                                if c == "1h" || c == "5m"
+                                   then do
+                                       fs <- getFileStatus c
+                                       return $ if isRegularFile fs
+                                            then False
+                                            else True
+                                   else return True
+                       filtered <- filterM (\x -> do
+                                    p <- purgeContents x
+                                    let p' = (not $ isPrefixOf "." x)
+                                    return $ p || p') contents
+
+                       mapM_ addWork filtered
                        void $ forM counters $ \(_,countD) ->
                             atomicModifyIORef' countD (\v -> (v `addD` DirCount 1, ()))
                    else do
-                       withCString (unAbsFilePath a) $ \c -> c_hs_read_bytes bufSize c buffer
+                       --withCString (unAbsFilePath a) $ \c -> c_hs_read_bytes bufSize c buffer
+                       let absPath = unAbsFilePath a
+                           paths = [absPath, replace "10s" "5m" absPath, replace "10s" "1h" absPath]
+                       strs <- mapM newCString paths
+                       withArray strs $ \ps -> c_hs_read_bytes bufSize (length paths) ps buffer
+                       mapM free strs
                        void $ forM counters $ \(countF,_) ->
                             atomicModifyIORef' countF (\v -> (v `addF` FileCount 1, ()))
             atomically $ modifyTVar' work (\x -> x - 1)
@@ -185,4 +204,4 @@ main = do
   return ()
 
 foreign import ccall "hs_read_bytes"
-    c_hs_read_bytes :: Int -> CString -> Ptr CChar -> IO Int
+    c_hs_read_bytes :: Int -> Int -> Ptr CString -> Ptr CChar -> IO Int
