@@ -36,13 +36,59 @@ import qualified Data.Time.Clock.POSIX as POSIX
 import Data.IORef
 import Foreign.C
 import Foreign.C.String
---import qualified TH as CH
+import Options.Applicative     ( Parser
+                               , execParser
+                               , argument
+                               , info
+                               , helper
+                               , fullDesc
+                               , help
+                               , switch
+                               , metavar
+                               , str
+                               , long
+                               , short
+                               , value
+                               , strOption
+                               , option
+                               , auto
+                               )
+import Data.Monoid ((<>))
+
+data CliArguments = CliArguments
+    { dir :: !FilePath
+    , workers :: !Int
+    , count :: !Bool
+    }
+
+parseArgs :: IO CliArguments
+parseArgs = execParser $ info (helper <*> parseCliArgs) fullDesc
+
+parseCliArgs :: Parser CliArguments
+parseCliArgs =
+    let directory = strOption
+            ( long "directory"
+            <> short 'd'
+            <> help "Directory to operate on"
+            )
+        workers =  option auto
+            ( long "workers"
+            <> short 'w'
+            <> help "number of workers"
+            <> value 100
+            )
+        count = option auto
+            ( long "count"
+            <> short 'c'
+            <> help "run the counter/timer"
+            <> value False
+            )
+    in CliArguments <$> directory <*> workers <*> count
+
 
 bufSize :: Int
 bufSize = 464
 
-numWorkers :: Int
-numWorkers = 1
 
 newtype AbsFilePath = AbsFilePath { unAbsFilePath :: FilePath } deriving Show
 type WorkUnit = (FileStatus, FilePath, AbsFilePath)
@@ -50,10 +96,10 @@ type WorkUnit = (FileStatus, FilePath, AbsFilePath)
 l `addF` r = FileCount $ unFileCount l + unFileCount r
 l `addD` r = DirCount $ unDirCount l + unDirCount r
 
-worker :: UChan.InChan WorkUnit -> UChan.OutChan WorkUnit -> TVar Int -> Count -> IO ()
-worker wchan rchan work (countF,countD) = do
+worker :: UChan.InChan WorkUnit -> UChan.OutChan WorkUnit -> TVar Int -> Maybe Count -> IO ()
+worker wchan rchan work counters = do
     void $ forkIO $ do
---        buffer <- return $ allocaBytes bufSize
+        buffer <- mallocBytes bufSize
         forever $ do
             (fs, r, a) <- UChan.readChan rchan
             when (not $ isPrefixOf "." r) $ do
@@ -67,16 +113,12 @@ worker wchan rchan work (countF,countD) = do
 
                        contents <- getDirectoryContents $ unAbsFilePath a
                        mapM_ addWork contents
---                       atomically $ modifyTVar' countD (`addD` DirCount 1)
-                       atomicModifyIORef' countD (\v -> (v `addD` DirCount 1, ()))
+                       void $ forM counters $ \(_,countD) ->
+                            atomicModifyIORef' countD (\v -> (v `addD` DirCount 1, ()))
                    else do
---                       withBinaryFile (unAbsFilePath a) ReadMode $ \h -> buffer $ \b -> do
---                            hSetBuffering h $ BlockBuffering $ Just bufSize
---                            void $ hGetBufNonBlocking h b bufSize
---                       void $ fmap (BSL.take (fromIntegral bufSize)) $ BSL.readFile $ unAbsFilePath a
-                       withCString (unAbsFilePath a) $ \c -> c_hs_read_bytes bufSize c
---                       atomically $ modifyTVar' countF (`addF` FileCount 1)
-                       atomicModifyIORef' countF (\v -> (v `addF` FileCount 1, ()))
+                       withCString (unAbsFilePath a) $ \c -> c_hs_read_bytes bufSize c buffer
+                       void $ forM counters $ \(countF,_) ->
+                            atomicModifyIORef' countF (\v -> (v `addF` FileCount 1, ()))
             atomically $ modifyTVar' work (\x -> x - 1)
 
 newtype FileCount = FileCount { unFileCount :: Int }
@@ -92,16 +134,6 @@ timer (countF, countD) = do
   void $ async $ forever $ do
     s <- POSIX.getPOSIXTime
     threadDelay 1000000
---    (curFiles, totalFiles, curDirs, totalDirs) <- atomically $ do
---      fc <- readTVar countF
---      dc <- readTVar countD
---      writeTVar countF $ FileCount 0
---      writeTVar countD $ DirCount 0
---      tfc <- readTVar totalF
---      tdc <- readTVar totalD
---      modifyTVar' totalF (`addF` fc)
---      modifyTVar' totalD (`addD` dc)
---      return (fc, fc `addF` tfc, dc, dc `addD` tdc)
     fc <- atomicModifyIORef' countF $ \v -> (FileCount 0, v)
     dc <- atomicModifyIORef' countD $ \v -> (DirCount 0, v)
 
@@ -126,28 +158,25 @@ timer (countF, countD) = do
 
 main :: IO ()
 main = do
-  args <- getArgs
+  args <- parseArgs
   (wchan, rchan) <- UChan.newChan
   work <- newTVarIO 0
   countF <- newIORef $ FileCount 0
   countD <- newIORef $ DirCount 0
-  _ <- timer (countF,countD)
+  when (count args) $
+    timer (countF,countD)
   let mkWork f = do
         fs <- getFileStatus f
         return $ (fs, "", AbsFilePath f)
-  configNumWorkers <- case args of
-    [path] -> do
-        w <- mkWork path
-        atomically $ modifyTVar' work (+1)
-        UChan.writeChan wchan w
-        return (numWorkers)
-    [path, nw] -> do
-        w <- mkWork path
-        atomically $ modifyTVar' work (+1)
-        UChan.writeChan wchan w
-        return $ read nw
 
-  mapM_ (\_ -> worker wchan rchan work (countF,countD)) [1..configNumWorkers]
+  w <- mkWork (dir args)
+  atomically $ modifyTVar' work (+1)
+  UChan.writeChan wchan w
+
+  let counters = if count args
+        then Just $ (countF, countD)
+        else Nothing
+  mapM_ (\_ -> worker wchan rchan work counters) [1..(workers args)]
 
   atomically $ do
       val <- readTVar work
@@ -156,4 +185,4 @@ main = do
   return ()
 
 foreign import ccall "hs_read_bytes"
-    c_hs_read_bytes :: Int -> CString -> IO Int
+    c_hs_read_bytes :: Int -> CString -> Ptr CChar -> IO Int
