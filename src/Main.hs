@@ -110,9 +110,10 @@ worker wchan rchan work counters = do
                 then do
                     let addWork w = do
                             let aw = absPath </> w
-                            atomically $ modifyTVar' work (+1)
-    --                            wfs <- getFileStatus aw
-                            UChan.writeChan wchan (w, AbsFilePath aw)
+--                            atomically $ modifyTVar' work (+1)
+--    --                            wfs <- getFileStatus aw
+--                            UChan.writeChan wchan (w, AbsFilePath aw)
+                            (w, AbsFilePath aw)
 
                     contents <- getDirectoryContents $ absPath
 --                    let purgeContents c = do
@@ -130,15 +131,18 @@ worker wchan rchan work counters = do
                         ctrh = (/=) "1h"
                         ctrm = (/=) "5m"
                         conditions x = all ($ x) [pfx, ctrh, ctrm]
-                        filtered = filter (conditions) contents
-                    mapM_ addWork filtered
+                        filtered = map addWork $ filter (conditions) contents
+--                    mapM_ addWork filtered
+
+                    atomically $ modifyTVar' work (+(length filtered))
+                    UChan.writeList2Chan wchan filtered
                     void $ forM counters $ \(_,countD) ->
                         atomicModifyIORef' countD (\v -> (v `addD` DirCount 1, ()))
                 else do
                     --withCString (unAbsFilePath a) $ \c -> c_hs_read_bytes bufSize c buffer
                     let paths = [absPath, replace "10s" "5m" absPath, replace "10s" "1h" absPath]
                     strs <- mapM newCString paths
-                    withArray strs $ \ps -> c_hs_read_bytes bufSize (length paths) ps buffer
+                    withArray strs $ \ps -> c_hs_read_bytes_a bufSize (length paths) ps buffer
                     mapM free strs
                     void $ forM counters $ \(countF,_) ->
                         atomicModifyIORef' countF (\v -> (v `addF` FileCount 1, ()))
@@ -207,4 +211,7 @@ main = do
   return ()
 
 foreign import ccall "hs_read_bytes"
-    c_hs_read_bytes :: Int -> Int -> Ptr CString -> Ptr CChar -> IO Int
+    c_hs_read_bytes :: Int -> CString -> Ptr CChar -> IO Int
+
+foreign import ccall "hs_read_bytes_a"
+    c_hs_read_bytes_a :: Int -> Int -> Ptr CString -> Ptr CChar -> IO Int
